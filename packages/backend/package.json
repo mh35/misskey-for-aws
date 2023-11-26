@@ -59,8 +59,8 @@
 	"dependencies": {
 		"@aws-sdk/client-s3": "3.412.0",
 		"@aws-sdk/lib-storage": "3.412.0",
-		"@aws-sdk/client-ses": "3.412.0",
-		"@aws-sdk/client-dynamodb": "3.412.0",
+		"@aws-sdk/client-ses": "3.410.0",
+		"@aws-sdk/client-dynamodb": "3.410.0",
 		"@bull-board/api": "5.9.1",
 		"@bull-board/fastify": "5.9.1",
 		"@bull-board/ui": "5.9.1",
