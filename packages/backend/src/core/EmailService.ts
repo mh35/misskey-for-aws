@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 
-import * as nodemailer from 'nodemailer';
 import { Inject, Injectable } from '@nestjs/common';
 import { validate as validateEmail } from 'deep-email-validator';
 import { MetaService } from '@/core/MetaService.js';
@@ -13,10 +12,14 @@ import type Logger from '@/logger.js';
 import type { UserProfilesRepository } from '@/models/_.js';
 import { LoggerService } from '@/core/LoggerService.js';
 import { bindThis } from '@/decorators.js';
+import { DynamoDBClient, GetItemCommand, UpdateItemCommand } from '@aws-sdk/client-dynamodb';
+import { SESClient, SendEmailCommand } from '@aws-sdk/client-ses';
 
 @Injectable()
 export class EmailService {
 	private logger: Logger;
+	private client: SESClient;
+	private dynamoDb: DynamoDBClient;
 
 	constructor(
 		@Inject(DI.config)
@@ -29,6 +32,8 @@ export class EmailService {
 		private loggerService: LoggerService,
 	) {
 		this.logger = this.loggerService.getLogger('email');
+		this.client = new SESClient();
+		this.dynamoDb = new DynamoDBClient();
 	}
 
 	@bindThis
@@ -37,29 +42,18 @@ export class EmailService {
 
 		const iconUrl = `${this.config.url}/static-assets/mi-white.png`;
 		const emailSettingUrl = `${this.config.url}/settings/email`;
+		
+		const checkRes = await this.checkEmailBounce(to);
+		if (checkRes) {
+			this.logger.error("Email address " + to + " is registered on bounce table.");
+			throw new Error("Email address " + to + " is registered on bounce table.");
+		}
 
-		const enableAuth = meta.smtpUser != null && meta.smtpUser !== '';
 
-		const transporter = nodemailer.createTransport({
-			host: meta.smtpHost,
-			port: meta.smtpPort,
-			secure: meta.smtpSecure,
-			ignoreTLS: !enableAuth,
-			proxy: this.config.proxySmtp,
-			auth: enableAuth ? {
-				user: meta.smtpUser,
-				pass: meta.smtpPass,
-			} : undefined,
-		} as any);
 
 		try {
 			// TODO: htmlサニタイズ
-			const info = await transporter.sendMail({
-				from: meta.email!,
-				to: to,
-				subject: subject,
-				text: text,
-				html: `<!doctype html>
+			const htmlData: string = `<!doctype html>
 <html>
 	<head>
 		<meta charset="utf-8">
@@ -138,10 +132,32 @@ export class EmailService {
 			<a href="${ this.config.url }">${ this.config.host }</a>
 		</nav>
 	</body>
-</html>`,
+</html>`;
+			const command = new SendEmailCommand({
+				Source: meta.email!,
+				Destination: {
+					ToAddresses: [to]
+				},
+				Message: {
+					Subject: {
+						Data: subject,
+						Charset: "UTF-8"
+					},
+					Body: {
+						Text: {
+							Data: text,
+							Charset: "UTF-8"
+						},
+						Html: {
+							Data: htmlData,
+							Charset: "UTF-8"
+						}
+					}
+				}
 			});
+			const sesRes = await this.client.send(command);
 
-			this.logger.info(`Message sent: ${info.messageId}`);
+			this.logger.info(`Message sent: ${sesRes.MessageId}`);
 		} catch (err) {
 			this.logger.error(err as Error);
 			throw err;
@@ -159,6 +175,8 @@ export class EmailService {
 			emailVerified: true,
 			email: emailAddress,
 		});
+		
+		const checkBounce = await this.checkEmailBounce(emailAddress);
 
 		const validated = meta.enableActiveEmailValidation ? await validateEmail({
 			email: emailAddress,
@@ -169,17 +187,54 @@ export class EmailService {
 			validateSMTP: false, // 日本だと25ポートが殆どのプロバイダーで塞がれていてタイムアウトになるので
 		}) : { valid: true, reason: null };
 
-		const available = exist === 0 && validated.valid;
+		const available = exist === 0 && validated.valid && !checkBounce;
 
 		return {
 			available,
 			reason: available ? null :
 			exist !== 0 ? 'used' :
+			checkBounce ? 'smtp' :
 			validated.reason === 'regex' ? 'format' :
 			validated.reason === 'disposable' ? 'disposable' :
 			validated.reason === 'mx' ? 'mx' :
 			validated.reason === 'smtp' ? 'smtp' :
 			null,
 		};
+	}
+	
+	@bindThis
+	private async checkEmailBounce(emailAddress: string): Promise<boolean> {
+		const tableName = process.env.BOUNCE_TABLE_NAME;
+		if (!tableName) {
+			return false;
+		}
+		const getItemCmd = new GetItemCommand({
+			TableName: tableName,
+			Key: {
+				"email": {"S": emailAddress},
+				"category": {"S": "Bounce_Info"}
+			}
+		});
+		const getItemRes = await this.dynamoDb.send(getItemCmd);
+		if (!getItemRes.Item) {
+			return false;
+		}
+		const endTime = Math.floor(Date.now() / 1000) + 86400 * 7;
+		const updateItemCmd = new UpdateItemCommand({
+			TableName: tableName,
+			Key: {
+				"email": {"S": emailAddress},
+				"category": {"S": "Bounce_Info"}
+			},
+			UpdateExpression: "SET #TL = :tl",
+			ExpressionAttributeNames: {
+				"#TL": "ttl"
+			},
+			ExpressionAttributeValues: {
+				":tl": {"N": endTime.toString()}
+			}
+		});
+		await this.dynamoDb.send(updateItemCmd);
+		return true;
 	}
 }
